@@ -1,0 +1,10 @@
+PyQt5
+requests
+python-binance
+pandas
+numpy
+matplotlib
+psutil
+pyqtgraph
+ta
+ta-lib

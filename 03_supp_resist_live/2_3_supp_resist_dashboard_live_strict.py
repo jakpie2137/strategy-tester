@@ -1,0 +1,265 @@
+# -*- coding: utf-8 -*-
+"""
+2_3_supp_resist_dashboard_live_strict.py — Tk dashboard for STRICT LIVE S/R tracks.
+- Price source: data/realtime_data.db (table 'candles')
+- Tracks source: data/realtime_suppres_detection.db (sr_tracks, sr_track_points)
+- "Run STRICT detection" calls 1_3_supp_resist_live_strict.py (background thread).
+- Auto refresh chart + optional Auto-run STRICT detection when a new candle appears.
+"""
+import os, sqlite3, importlib.util, sys, logging, threading, time
+import numpy as np, pandas as pd
+import tkinter as tk
+from tkinter import ttk, messagebox
+
+import matplotlib
+matplotlib.use('TkAgg')
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
+
+_LOG_LEVEL = os.environ.get("TP_LOG", "INFO").upper()
+logging.basicConfig(level=getattr(logging, _LOG_LEVEL, logging.INFO),
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s", stream=sys.stdout)
+log = logging.getLogger("sr-dashboard-live-strict")
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+IN_DB  = os.path.join(HERE, "data", "realtime_data.db")
+OUT_DB = os.path.join(HERE, "data", "realtime_suppres_detection.db")
+TABLE  = "candles"
+
+# Load strict detector module
+spec = importlib.util.spec_from_file_location("sr_live_strict", os.path.join(HERE, "1_3_supp_resist_live_strict.py"))
+strict = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = strict
+spec.loader.exec_module(strict)
+
+def get_symbols(db_path: str, table: str = TABLE):
+    try:
+        with sqlite3.connect(db_path) as con:
+            df = pd.read_sql_query(f"SELECT DISTINCT symbol FROM {table}", con)
+        return sorted(df["symbol"].astype(str).tolist()) if not df.empty else []
+    except Exception as e:
+        log.error("get_symbols: %s", e)
+        return []
+
+def read_latest_ohlc(db_path: str, symbol: str, limit: int = 5000, table: str = TABLE):
+    try:
+        with sqlite3.connect(db_path) as con:
+            df = pd.read_sql_query(
+                f"SELECT symbol, close_time, open, high, low, close FROM {table} WHERE symbol=? ORDER BY close_time DESC LIMIT ?",
+                con, params=[symbol, int(limit)])
+        if df.empty: return df
+        df = df.dropna().sort_values("close_time").reset_index(drop=True)
+        df["idx"] = df.index.values
+        return df
+    except Exception as e:
+        log.error("read_latest_ohlc: %s", e)
+        return pd.DataFrame(columns=["symbol","close_time","open","high","low","close","idx"])
+
+def read_tracks(out_db: str, symbol: str, method: str, lookback: int):
+    try:
+        with sqlite3.connect(out_db) as con:
+            q = ( "SELECT t.id as track_id, p.ts, p.center, p.low, p.high "
+                  "FROM sr_tracks t JOIN sr_track_points p ON p.track_id=t.id "
+                  "WHERE t.symbol=? AND t.method=? AND t.lookback=? ORDER BY t.id, p.ts" )
+            df = pd.read_sql_query(q, con, params=[symbol, method, int(lookback)])
+        return df
+    except Exception as e:
+        log.error("read_tracks: %s", e)
+        return pd.DataFrame(columns=["track_id","ts","center","low","high"])
+
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Support/Resistance Dashboard LIVE (STRICT)")
+        self.geometry("1240x860")
+
+        self.symbols = get_symbols(IN_DB, TABLE) or ["(no data)"]
+
+        top = ttk.Frame(self); top.pack(side=tk.TOP, fill=tk.X, padx=8, pady=8)
+        ttk.Label(top, text="Symbol").pack(side=tk.LEFT)
+        self.cmb_symbol = ttk.Combobox(top, values=self.symbols, width=18, state="readonly")
+        self.cmb_symbol.pack(side=tk.LEFT, padx=6); self.cmb_symbol.set(self.symbols[0])
+        self.cmb_symbol.bind('<<ComboboxSelected>>', lambda e: self.draw_plot())
+
+        ttk.Label(top, text="Method").pack(side=tk.LEFT, padx=(18,2))
+        methods = list(getattr(strict, "METHODS", {"wick_body":"default"}).keys())
+        self.cmb_method = ttk.Combobox(top, values=methods, width=12, state="readonly")
+        default_method = getattr(strict, "DEFAULT_METHOD", methods[0])
+        self.cmb_method.set(default_method); self.cmb_method.pack(side=tk.LEFT, padx=6)
+        self.cmb_method.bind('<<ComboboxSelected>>', lambda e: self.draw_plot())
+
+        ttk.Label(top, text="Lookback (I)").pack(side=tk.LEFT, padx=(18,2))
+        self.ent_lookback = ttk.Entry(top, width=8); self.ent_lookback.insert(0, "3000"); self.ent_lookback.pack(side=tk.LEFT, padx=6)
+
+        ttk.Label(top, text="N (candles/level)").pack(side=tk.LEFT, padx=(18,2))
+        self.ent_N = ttk.Entry(top, width=8); self.ent_N.insert(0, "500"); self.ent_N.pack(side=tk.LEFT, padx=6)
+
+        ttk.Label(top, text="K (levels cap)").pack(side=tk.LEFT, padx=(18,2))
+        self.ent_K = ttk.Entry(top, width=6); self.ent_K.insert(0, "10"); self.ent_K.pack(side=tk.LEFT, padx=6)
+
+        ttk.Label(top, text="R (min sep, %)").pack(side=tk.LEFT, padx=(18,2))
+        self.ent_R = ttk.Entry(top, width=8); self.ent_R.insert(0, "0.5"); self.ent_R.pack(side=tk.LEFT, padx=6)
+
+        ttk.Label(top, text="Price limit").pack(side=tk.LEFT, padx=(18,2))
+        self.ent_limit = ttk.Entry(top, width=8); self.ent_limit.insert(0, "15000"); self.ent_limit.pack(side=tk.LEFT, padx=6)
+
+        ttk.Label(top, text="Stride").pack(side=tk.LEFT, padx=(18,2))
+        self.ent_stride = ttk.Entry(top, width=6); self.ent_stride.insert(0, "3"); self.ent_stride.pack(side=tk.LEFT, padx=6)
+
+        self.var_include_curr = tk.BooleanVar(value=True)
+        ttk.Checkbutton(top, text="Include current bar", variable=self.var_include_curr).pack(side=tk.LEFT, padx=10)
+
+        ttk.Button(top, text="Refresh chart", command=self.draw_plot).pack(side=tk.LEFT, padx=10)
+        self.btn_run = ttk.Button(top, text="Run STRICT detection", command=self.run_detection)
+        self.btn_run.pack(side=tk.LEFT, padx=10)
+
+        # Auto refresh controls
+        self.auto = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top, text="Auto refresh chart", variable=self.auto, command=self._toggle_auto).pack(side=tk.LEFT, padx=10)
+        ttk.Label(top, text="every (s)").pack(side=tk.LEFT)
+        self.ent_autoint = ttk.Entry(top, width=6); self.ent_autoint.insert(0, "10"); self.ent_autoint.pack(side=tk.LEFT, padx=4)
+
+        # Auto-run STRICT when new candle arrives
+        self.autorun = tk.BooleanVar(value=True)
+        ttk.Checkbutton(top, text="Auto-run STRICT on new candle", variable=self.autorun).pack(side=tk.LEFT, padx=10)
+
+        fig = Figure(figsize=(10,5), dpi=100)
+        self.ax = fig.add_subplot(111); self.ax.grid(True, alpha=0.3)
+        self.canvas = FigureCanvasTkAgg(fig, master=self)
+        self.canvas_widget = self.canvas.get_tk_widget(); self.canvas_widget.pack(side=tk.TOP, fill=tk.BOTH, expand=True)
+        toolbar = NavigationToolbar2Tk(self.canvas, self); toolbar.update()
+
+        self._auto_thread = None
+        self._auto_stop   = threading.Event()
+        self._running     = False
+        self._last_tip_ts = None
+
+        self.draw_plot()
+
+    def _toggle_auto(self):
+        if self.auto.get():
+            try:
+                interval = max(2, int(self.ent_autoint.get()))
+            except:
+                interval = 10
+            self._start_auto(interval)
+        else:
+            self._stop_auto()
+
+    def _start_auto(self, interval: int):
+        if self._auto_thread and self._auto_thread.is_alive():
+            return
+        self._auto_stop.clear()
+        def runner():
+            while not self._auto_stop.is_set():
+                try:
+                    self.draw_plot()
+                    if self.autorun.get() and not self._running:
+                        # if a new candle appeared, run detection incrementally
+                        sym = self.cmb_symbol.get()
+                        if sym != "(no data)":
+                            tip = self._latest_close_ts(IN_DB, sym, TABLE)
+                            if tip and tip != self._last_tip_ts:
+                                self._last_tip_ts = tip
+                                self._spawn_run()
+                except Exception as e:
+                    log.error("auto loop failed: %s", e)
+                t = interval
+                for _ in range(t):
+                    if self._auto_stop.is_set(): break
+                    time.sleep(1)
+        self._auto_thread = threading.Thread(target=runner, daemon=True)
+        self._auto_thread.start()
+
+    def _stop_auto(self):
+        self._auto_stop.set()
+
+    def _latest_close_ts(self, db_path: str, symbol: str, table: str) -> str:
+        try:
+            with sqlite3.connect(db_path) as con:
+                cur = con.cursor()
+                cur.execute(f"SELECT MAX(close_time) FROM {table} WHERE symbol=?", (symbol,))
+                r = cur.fetchone()
+                return str(r[0]) if r and r[0] is not None else None
+        except Exception:
+            return None
+
+    def _spawn_run(self):
+        if self._running: return
+        self._running = True
+        self.btn_run.state(['disabled'])
+        symbol, method, lookback, N, K, R_frac, limit, stride, include_current = self._get_params()
+        def worker():
+            try:
+                strict.run_once(IN_DB, OUT_DB, method, lookback, N, K, R_frac,
+                                symbols=symbol, stride=stride, include_current=include_current, table=TABLE)
+            finally:
+                self.after(0, self._after_run)
+        import threading
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _after_run(self):
+        self._running = False
+        self.btn_run.state(['!disabled'])
+        self.draw_plot()
+
+    def _get_params(self):
+        symbol = self.cmb_symbol.get()
+        method = self.cmb_method.get()
+        try: lookback = max(100, int(self.ent_lookback.get()))
+        except: lookback = 3000
+        try: N = max(1, int(self.ent_N.get()))
+        except: N = 500
+        try: K = max(1, int(self.ent_K.get()))
+        except: K = 10
+        try: R_frac = float(self.ent_R.get()) / 100.0
+        except: R_frac = 0.005
+        try: limit = max(100, int(self.ent_limit.get()))
+        except: limit = 15000
+        try: stride = max(1, int(self.ent_stride.get()))
+        except: stride = 3
+        include_current = 1 if self.var_include_curr.get() else 0
+        return symbol, method, lookback, N, K, R_frac, limit, stride, include_current
+
+    def run_detection(self):
+        if self._running: return
+        self._spawn_run()
+
+    def draw_plot(self):
+        symbol, method, lookback, N, K, R_frac, limit, stride, include_current = self._get_params()
+        self.ax.clear(); self.ax.grid(True, alpha=0.3)
+        if symbol == "(no data)":
+            self.ax.set_title("No data"); self.canvas.draw(); return
+
+        dfp = read_latest_ohlc(IN_DB, symbol, limit=limit, table=TABLE)
+        if dfp.empty or len(dfp) < 2:
+            self.ax.set_title(f"{symbol} (no price data)"); self.canvas.draw(); return
+
+        x = dfp["idx"].to_numpy(); y = dfp["close"].to_numpy()
+        self.ax.plot(x, y, linewidth=1.2, label="close")
+        tmin = str(dfp["close_time"].iloc[0]); tmax = str(dfp["close_time"].iloc[-1])
+        self._last_tip_ts = tmax  # for auto-run
+
+        dft = read_tracks(OUT_DB, symbol, method, lookback)
+        if dft is None or dft.empty:
+            self.ax.set_title(f"{symbol} | {method} | I={lookback} (no tracks — run STRICT detection)")
+            self.canvas.draw(); return
+
+        mapdf = dfp[["close_time","idx"]].copy()
+        dft = dft[(dft["ts"] >= tmin) & (dft["ts"] <= tmax)]
+        if dft.empty:
+            self.ax.set_title(f"{symbol} | {method} | I={lookback} (no track points in window)")
+            self.canvas.draw(); return
+        dft = dft.merge(mapdf, left_on="ts", right_on="close_time", how="left").dropna(subset=["idx"])
+
+        for tid, grp in dft.groupby("track_id"):
+            grp = grp.sort_values("idx")
+            self.ax.plot(grp["idx"], grp["center"], linestyle='-', linewidth=1.8, alpha=1.0)
+            self.ax.plot(grp["idx"], grp["low"], linestyle='--', linewidth=1.0, alpha=1.0)
+            self.ax.plot(grp["idx"], grp["high"], linestyle='--', linewidth=1.0, alpha=1.0)
+
+        self.ax.set_title(f"{symbol} | {method} | I={lookback}  (N={N}, K={K}, R={R_frac*100:.2f}%, stride={stride})")
+        self.canvas.draw()
+
+if __name__ == "__main__":
+    App().mainloop()

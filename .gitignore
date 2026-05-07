@@ -1,0 +1,37 @@
+# Python cache/bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Environment and local secrets
+.env
+.env.*
+
+# Logs
+*.log
+logs/
+
+# Test/backtest artifacts and local exports
+results/
+exports/
+data/
+tmp/
+
+# Local databases
+*.db
+*.sqlite
+*.sqlite3
+
+# IDE/editor
+.idea/
+.vscode/
+
+# OS noise
+.DS_Store
+Thumbs.db
